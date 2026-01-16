@@ -309,7 +309,7 @@ class NotebookLMSingleFolderApp(ctk.CTk):
         try:
             self.fm.ensure_structure()
         except PermissionError:
-            fallback = os.path.join(os.path.expanduser("~"), "NotebookLM_Review")
+            fallback = os.path.join(os.path.expanduser("~"), "LMReview_Review")
             self.logger.warning("原始路徑無法寫入，改用使用者資料夾：%s", fallback)
             self.cfg.base_path = fallback
             self.fm = FileManager(self.cfg, self.logger)
