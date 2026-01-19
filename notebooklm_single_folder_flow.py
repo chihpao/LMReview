@@ -4,7 +4,10 @@ import os
 import re
 import sys
 import time
+import json
+import importlib.util
 import logging
+from logging.handlers import RotatingFileHandler
 import webbrowser
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
@@ -17,7 +20,7 @@ from watchdog.events import FileSystemEventHandler
 
 # ==================== 基本設定 ====================
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.4.1"
 
 def get_base_path() -> str:
     """取得程式基底路徑（支援 PyInstaller）"""
@@ -35,6 +38,10 @@ class AppConfig:
 
     input_folder: str = "input"
     output_folder: str = "output"
+    settings_filename: str = "settings.json"
+    config_filename: str = "lmreview_config.json"
+    config_loaded: bool = field(default=False, init=False, repr=False)
+    config_error: Optional[str] = field(default=None, init=False, repr=False)
 
     tags = ["【標準】", "【範本】", "【待審】"]
 
@@ -43,6 +50,47 @@ class AppConfig:
             self.projects = ["【雲端案】", "【整合案】", "【Trod案】"]
         if self.deliveries is None:
             self.deliveries = ["【契約交付】", "【其他交付】"]
+        self.config_loaded = self._load_config()
+
+    def _load_config(self) -> bool:
+        path = os.path.join(self.base_path, self.config_filename)
+        self.config_error = None
+        if not os.path.exists(path):
+            return False
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception as e:
+            self.config_error = f"設定檔讀取失敗：{e}"
+            return False
+        if not isinstance(data, dict):
+            self.config_error = "設定檔格式錯誤：需為 JSON 物件"
+            return False
+        projects = self._normalize_list(data.get("projects"))
+        deliveries = self._normalize_list(data.get("deliveries"))
+        if not projects and not deliveries:
+            self.config_error = "設定檔缺少有效的 projects 或 deliveries"
+            return False
+        if projects:
+            self.projects = projects
+        if deliveries:
+            self.deliveries = deliveries
+        return True
+
+    def _normalize_list(self, values: object) -> Optional[List[str]]:
+        if not isinstance(values, list):
+            return None
+        cleaned: List[str] = []
+        seen = set()
+        for value in values:
+            if not isinstance(value, str):
+                continue
+            item = value.strip()
+            if not item or item in seen:
+                continue
+            cleaned.append(item)
+            seen.add(item)
+        return cleaned or None
 
 # ==================== 工具 ====================
 
@@ -60,14 +108,21 @@ def now_ts() -> str:
     return time.strftime("%Y%m%d_%H%M%S")
 
 def is_skip_file(fn: str) -> bool:
+    lower = fn.lower()
+    if lower in {"thumbs.db", "desktop.ini"}:
+        return True
     return fn.startswith("~$") or fn.startswith(".") or fn.endswith(".tmp")
 
-def open_folder(path: str):
+def open_folder(path: str) -> Tuple[bool, str]:
     os.makedirs(path, exist_ok=True)
-    if os.name == 'nt':
-        os.startfile(path)
-    else:
-        webbrowser.open(f'file://{path}')
+    try:
+        if os.name == "nt":
+            os.startfile(path)
+        else:
+            webbrowser.open(f"file://{os.path.abspath(path)}")
+        return True, ""
+    except Exception as e:
+        return False, str(e)
 
 # ==================== 檔案管理 ====================
 
@@ -96,11 +151,16 @@ class FileManager:
         folder = self.input_dir(project, delivery)
         if not os.path.exists(folder):
             return [], []
-        
-        all_files = [
-            f for f in os.listdir(folder)
-            if os.path.isfile(os.path.join(folder, f)) and not is_skip_file(f)
-        ]
+
+        try:
+            with os.scandir(folder) as entries:
+                all_files = [
+                    entry.name for entry in entries
+                    if entry.is_file() and not is_skip_file(entry.name)
+                ]
+        except OSError as e:
+            self.logger.error("讀取資料夾失敗：%s", e)
+            return [], []
         
         tagged = [f for f in all_files if any(f.startswith(t) for t in self.cfg.tags)]
         untagged = [f for f in all_files if not any(f.startswith(t) for t in self.cfg.tags)]
@@ -117,6 +177,9 @@ class FileManager:
         try:
             if not os.path.exists(old_path):
                 return False, "檔案不存在"
+
+            if any(filename.startswith(t) for t in self.cfg.tags):
+                return False, "檔案已標記"
             
             if os.path.exists(new_path):
                 return False, "目標檔名已存在"
@@ -163,7 +226,7 @@ class WordExporter:
         doc = Document()
         
         # 標題
-        heading = doc.add_heading(f"{source_filename} 審查結果", level=1)
+        doc.add_heading(f"{source_filename} 審查結果", level=1)
         
         # 內容
         for line in content.splitlines():
@@ -246,26 +309,38 @@ class NotebookLMSingleFolderApp(ctk.CTk):
         self.exporter = WordExporter(self.logger)
 
         self._ensure_structure()
+        config_path = os.path.join(self.cfg.base_path, self.cfg.config_filename)
+        if os.path.exists(config_path) and not self.cfg.config_loaded:
+            detail = self.cfg.config_error or "未知原因"
+            self.logger.warning("設定檔讀取失敗：%s (%s)", config_path, detail)
+        self._settings = self._load_settings()
+        self._deps = {}
+        self._missing_docx_notified = False
+        self._config_error_shown = False
+        self._check_dependencies()
 
         self.title(f"LMReview 文件審查工作流程 v{APP_VERSION}")
-        self.geometry("1440x900")
         ctk.set_appearance_mode("Light")
+        self._configure_window()
 
         self.colors = {
-            "bg": "#f2f2f7",
+            "bg": "#f8f9fa",
             "panel": "#ffffff",
-            "sidebar": "#f6f6f8",
-            "text": "#1c1c1e",
-            "muted": "#6e6e73",
-            "border": "#d1d1d6",
-            "accent": "#007aff",
-            "accent_hover": "#0060df",
-            "success": "#34c759",
-            "danger": "#ff3b30"
+            "panel_alt": "#f1f3f4",
+            "sidebar": "#f8f9fa",
+            "text": "#202124",
+            "muted": "#5f6368",
+            "border": "#dadce0",
+            "accent": "#1a73e8",
+            "accent_hover": "#1967d2",
+            "accent_soft": "#e8f0fe",
+            "success": "#1e8e3e",
+            "danger": "#d93025",
+            "warning": "#f29900"
         }
         self.fonts = {
-            "title": ctk.CTkFont(family="Microsoft JhengHei UI", size=22, weight="bold"),
-            "section": ctk.CTkFont(family="Microsoft JhengHei UI", size=16, weight="bold"),
+            "title": ctk.CTkFont(family="Microsoft JhengHei UI", size=20, weight="bold"),
+            "section": ctk.CTkFont(family="Microsoft JhengHei UI", size=15, weight="bold"),
             "body": ctk.CTkFont(family="Microsoft JhengHei UI", size=13),
             "small": ctk.CTkFont(family="Microsoft JhengHei UI", size=12)
         }
@@ -274,15 +349,30 @@ class NotebookLMSingleFolderApp(ctk.CTk):
         self._refresh_job = None
         self._clipboard_job = None
         self._last_clipboard = None
+        self._clipboard_no_review_notice = False
         self._clipboard_poll_ms = 700
+        self._selected_untagged_file = None
+        self._untagged_item_widgets = {}
+        self._notification_job = None
+        self._notification_last_at = 0.0
+        self._notification_last_message = ""
+        self._notification_cooldown_ms = 1200
+        self._suppress_selection_change = False
+        self._suppress_notify_change = False
+        self._notification_policies = ["全部", "精簡", "靜音"]
 
         self._build_ui()
+        self._apply_settings()
+        self._update_dependency_ui(show_notice=True)
         self.refresh_all()
         self._start_watchdog()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(250, self._notify_config_error)
 
     def _setup_logger(self):
         logger = logging.getLogger("NotebookLM")
         logger.setLevel(logging.INFO)
+        logger.propagate = False
         if not logger.handlers:
             self._log_formatter = logging.Formatter("%(asctime)s - %(message)s")
             h = logging.StreamHandler()
@@ -299,7 +389,12 @@ class NotebookLMSingleFolderApp(ctk.CTk):
             log_dir = os.path.join(self.cfg.base_path, "logs")
             os.makedirs(log_dir, exist_ok=True)
             log_file = os.path.join(log_dir, f"notebooklm_{time.strftime('%Y%m%d')}.log")
-            fh = logging.FileHandler(log_file, encoding="utf-8")
+            fh = RotatingFileHandler(
+                log_file,
+                maxBytes=2 * 1024 * 1024,
+                backupCount=5,
+                encoding="utf-8"
+            )
             fh.setFormatter(formatter)
             logger.addHandler(fh)
         except Exception:
@@ -314,12 +409,195 @@ class NotebookLMSingleFolderApp(ctk.CTk):
             self.cfg.base_path = fallback
             self.fm = FileManager(self.cfg, self.logger)
             self.fm.ensure_structure()
+            if not self.cfg.config_loaded and self.cfg._load_config():
+                self.cfg.config_loaded = True
+                self.fm.ensure_structure()
             self._add_file_handler(self.logger)
-            messagebox.showwarning("資料夾權限", f"原始路徑無法寫入，已改用：\n{fallback}")
+            config_path = os.path.join(fallback, self.cfg.config_filename)
+            messagebox.showwarning(
+                "資料夾權限",
+                "原始路徑無法寫入，已改用：\n"
+                f"{fallback}\n\n"
+                "自訂專案/交付請放在設定檔：\n"
+                f"{config_path}"
+            )
+
+    def _configure_window(self):
+        default_w, default_h = 1440, 900
+        margin_w, margin_h = 40, 80
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        width = min(default_w, max(600, screen_w - margin_w))
+        height = min(default_h, max(500, screen_h - margin_h))
+        width = min(width, screen_w)
+        height = min(height, screen_h)
+        self.geometry(f"{width}x{height}")
+        self.minsize(min(1200, width), min(720, height))
+
+    def _settings_path(self) -> str:
+        return os.path.join(self.cfg.base_path, self.cfg.settings_filename)
+
+    def _load_settings(self) -> dict:
+        path = self._settings_path()
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                return data
+        except Exception as e:
+            self.logger.warning("讀取設定失敗：%s", e)
+        return {}
+
+    def _collect_settings(self) -> dict:
+        data = {}
+        if hasattr(self, "combo_project"):
+            data["last_project"] = self.combo_project.get()
+        if hasattr(self, "combo_delivery"):
+            data["last_delivery"] = self.combo_delivery.get()
+        if hasattr(self, "clipboard_auto_var"):
+            data["clipboard_auto"] = bool(self.clipboard_auto_var.get())
+        if hasattr(self, "notification_policy_var"):
+            data["notification_policy"] = self.notification_policy_var.get()
+        try:
+            data["window_geometry"] = self.geometry()
+        except TclError:
+            pass
+        return data
+
+    def _save_settings(self):
+        data = self._collect_settings()
+        if not data:
+            return
+        path = self._settings_path()
+        tmp_path = f"{path}.tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, path)
+        except Exception as e:
+            self.logger.warning("寫入設定失敗：%s", e)
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+
+    def _apply_settings(self):
+        if not self._settings:
+            return
+        self._suppress_selection_change = True
+        self._suppress_notify_change = True
+        try:
+            project = self._settings.get("last_project")
+            delivery = self._settings.get("last_delivery")
+            geometry = self._settings.get("window_geometry")
+            auto_clipboard = self._settings.get("clipboard_auto")
+            policy = self._settings.get("notification_policy")
+
+            if project in self.cfg.projects:
+                self.combo_project.set(project)
+            if delivery in self.cfg.deliveries:
+                self.combo_delivery.set(delivery)
+            if geometry:
+                self._apply_saved_geometry(str(geometry))
+            if policy in self._notification_policies:
+                self.notification_policy_var.set(policy)
+            if isinstance(auto_clipboard, bool) and auto_clipboard:
+                self.clipboard_auto_var.set(True)
+                self._last_clipboard = None
+                self._schedule_clipboard_poll(immediate=True)
+        finally:
+            self._suppress_selection_change = False
+            self._suppress_notify_change = False
+
+    def _apply_saved_geometry(self, geometry: str):
+        parsed = self._parse_geometry(geometry)
+        if not parsed:
+            return
+        width, height, x, y = parsed
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        width = min(max(600, width), screen_w)
+        height = min(max(500, height), screen_h)
+        x = max(0, min(x, max(0, screen_w - 50)))
+        y = max(0, min(y, max(0, screen_h - 50)))
+        self.geometry(f"{width}x{height}+{x}+{y}")
+        self.minsize(min(1200, width), min(720, height))
+
+    def _parse_geometry(self, geometry: str) -> Optional[Tuple[int, int, int, int]]:
+        match = re.match(r"^(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$", geometry)
+        if not match:
+            return None
+        width, height, x, y = match.groups()
+        return int(width), int(height), int(x), int(y)
+
+    def _module_available(self, module_name: str) -> bool:
+        try:
+            return importlib.util.find_spec(module_name) is not None
+        except Exception:
+            return False
+
+    def _check_dependencies(self):
+        self._deps["python-docx"] = self._module_available("docx")
+
+    def _refresh_dependencies(self):
+        self._check_dependencies()
+        self._update_dependency_ui()
+
+    def _update_dependency_ui(self, show_notice: bool = False):
+        if not hasattr(self, "dependency_label"):
+            return
+        ok = self._deps.get("python-docx", False)
+        if ok:
+            text = "Word 輸出: OK"
+            color = self.colors["success"]
+        else:
+            text = "Word 輸出: 需安裝"
+            color = self.colors["danger"]
+            if show_notice:
+                self.show_notification("⚠ 缺少 python-docx，無法輸出 Word")
+        self.dependency_label.configure(text=text, text_color=color)
+
+    def _ensure_docx_available(self, interactive: bool) -> bool:
+        self._refresh_dependencies()
+        if self._deps.get("python-docx", False):
+            return True
+        if interactive:
+            self._show_missing_docx()
+        else:
+            if not self._missing_docx_notified:
+                self.show_notification("⚠ 缺少 python-docx，無法輸出 Word")
+                self._missing_docx_notified = True
+        return False
+
+    def _show_missing_docx(self):
+        messagebox.showwarning(
+            "缺少套件",
+            "未安裝 python-docx，無法輸出 Word。\n"
+            "請執行：\n"
+            "python -m pip install python-docx\n"
+            "或使用 requirements.txt 安裝相依套件。"
+        )
+
+    def _notify_config_error(self):
+        if self._config_error_shown or not self.cfg.config_error:
+            return
+        self._config_error_shown = True
+        config_path = os.path.join(self.cfg.base_path, self.cfg.config_filename)
+        message = (
+            "設定檔讀取失敗，已使用預設專案/交付清單。\n"
+            f"原因：{self.cfg.config_error}\n"
+            f"檔案：{config_path}\n\n"
+            "格式範例：\n"
+            "{\n  \"projects\": [\"【雲端案】\"],\n  \"deliveries\": [\"【契約交付】\"]\n}"
+        )
+        messagebox.showwarning("設定檔警告", message)
 
     def _build_ui(self):
         # ========== 頂部導航列 ==========
-        top_bar = ctk.CTkFrame(self, height=64, fg_color=self.colors["panel"])
+        top_bar = ctk.CTkFrame(self, height=60, fg_color=self.colors["bg"])
         top_bar.pack(fill="x", padx=0, pady=0)
         top_bar.pack_propagate(False)
 
@@ -343,11 +621,11 @@ class NotebookLMSingleFolderApp(ctk.CTk):
 
         menu_kwargs = {
             "fg_color": self.colors["panel"],
-            "button_color": self.colors["border"],
-            "button_hover_color": self.colors["border"],
+            "button_color": self.colors["panel"],
+            "button_hover_color": self.colors["panel_alt"],
             "text_color": self.colors["text"],
             "dropdown_fg_color": self.colors["panel"],
-            "dropdown_hover_color": self.colors["sidebar"],
+            "dropdown_hover_color": self.colors["panel_alt"],
             "dropdown_text_color": self.colors["text"]
         }
 
@@ -380,16 +658,49 @@ class NotebookLMSingleFolderApp(ctk.CTk):
         )
         self.combo_delivery.pack(side="left", padx=5)
 
-        help_btn = ctk.CTkButton(
+        ctk.CTkLabel(
             project_frame,
-            text="使用說明",
-            command=self.show_help,
+            text="通知",
+            font=self.fonts["small"],
+            text_color=self.colors["muted"]
+        ).pack(side="left", padx=(12, 8))
+
+        self.notification_policy_var = ctk.StringVar(value=self._notification_policies[0])
+        self.notification_policy_menu = ctk.CTkOptionMenu(
+            project_frame,
+            values=self._notification_policies,
+            command=lambda _: self.on_notification_policy_change(),
             width=90,
             height=32,
+            font=self.fonts["body"],
+            variable=self.notification_policy_var,
+            **menu_kwargs
+        )
+        self.notification_policy_menu.pack(side="left", padx=5)
+
+        self.dependency_label = ctk.CTkLabel(
+            project_frame,
+            text="Word 輸出: 檢查中",
+            height=30,
             font=self.fonts["small"],
-            fg_color=self.colors["accent"],
-            hover_color=self.colors["accent_hover"],
-            text_color="#ffffff",
+            text_color=self.colors["muted"],
+            fg_color=self.colors["panel_alt"],
+            corner_radius=14
+        )
+        self.dependency_label.pack(side="left", padx=(12, 0))
+
+        help_btn = ctk.CTkButton(
+            project_frame,
+            text="?",
+            command=self.show_help,
+            width=32,
+            height=32,
+            font=self.fonts["small"],
+            fg_color=self.colors["panel"],
+            hover_color=self.colors["panel_alt"],
+            text_color=self.colors["text"],
+            border_width=1,
+            border_color=self.colors["border"],
             corner_radius=16
         )
         help_btn.pack(side="left", padx=(12, 0))
@@ -403,8 +714,8 @@ class NotebookLMSingleFolderApp(ctk.CTk):
 
         content.grid_rowconfigure(0, weight=1)
         content.grid_rowconfigure(1, weight=0)
-        content.grid_columnconfigure(0, weight=0, minsize=320)
-        content.grid_columnconfigure(1, weight=1)
+        content.grid_columnconfigure(0, weight=1, uniform="cols", minsize=520)
+        content.grid_columnconfigure(1, weight=1, uniform="cols", minsize=520)
 
         left_panel = ctk.CTkFrame(content, fg_color="transparent")
         left_panel.grid(row=0, column=0, sticky="nsew", padx=(20, 10), pady=20)
@@ -431,7 +742,7 @@ class NotebookLMSingleFolderApp(ctk.CTk):
         self.notification.grid(row=1, column=0, columnspan=2, sticky="ew", padx=20, pady=(0, 12))
 
         # ========== 底部狀態列 ==========
-        status_bar = ctk.CTkFrame(self, height=32, fg_color=self.colors["sidebar"])
+        status_bar = ctk.CTkFrame(self, height=32, fg_color=self.colors["panel_alt"])
         status_bar.pack(fill="x", side="bottom")
         status_bar.pack_propagate(False)
 
@@ -455,7 +766,7 @@ class NotebookLMSingleFolderApp(ctk.CTk):
 
     def _build_file_panel(self, parent):
         """左側：檔案標記區"""
-        sidebar = ctk.CTkFrame(parent, fg_color=self.colors["sidebar"], corner_radius=18)
+        sidebar = ctk.CTkFrame(parent, fg_color=self.colors["panel_alt"], corner_radius=18)
         sidebar.pack(fill="both", expand=True)
 
         header = ctk.CTkFrame(sidebar, fg_color="transparent")
@@ -464,12 +775,26 @@ class NotebookLMSingleFolderApp(ctk.CTk):
         header.grid_columnconfigure(1, weight=1)
         header.grid_columnconfigure(2, weight=0)
 
+        header_left = ctk.CTkFrame(header, fg_color="transparent")
+        header_left.grid(row=0, column=0, sticky="w")
+
+        step_badge = ctk.CTkLabel(
+            header_left,
+            text="Step 1",
+            font=self.fonts["small"],
+            text_color=self.colors["accent"],
+            fg_color=self.colors["accent_soft"],
+            corner_radius=10,
+            height=22
+        )
+        step_badge.pack(side="left", padx=(0, 8))
+
         ctk.CTkLabel(
-            header,
-            text="檔案",
+            header_left,
+            text="檔案標記",
             font=self.fonts["section"],
             text_color=self.colors["text"]
-        ).grid(row=0, column=0, sticky="w")
+        ).pack(side="left")
 
         self.file_tab_var = ctk.StringVar(value="待標記")
         self.file_tabs = ctk.CTkSegmentedButton(
@@ -479,13 +804,13 @@ class NotebookLMSingleFolderApp(ctk.CTk):
             command=self._on_file_tab_change,
             height=30,
             font=self.fonts["small"],
-            fg_color=self.colors["sidebar"],
+            fg_color=self.colors["panel_alt"],
             selected_color=self.colors["panel"],
             selected_hover_color=self.colors["panel"],
-            unselected_color=self.colors["sidebar"],
-            unselected_hover_color=self.colors["border"],
+            unselected_color=self.colors["panel_alt"],
+            unselected_hover_color=self.colors["panel"],
             text_color=self.colors["text"],
-            border_width=2
+            border_width=1
         )
         self.file_tabs.grid(row=0, column=1, sticky="ew", padx=12)
 
@@ -497,19 +822,23 @@ class NotebookLMSingleFolderApp(ctk.CTk):
             width=72,
             font=self.fonts["small"],
             fg_color=self.colors["panel"],
-            hover_color=self.colors["border"],
+            hover_color=self.colors["panel_alt"],
             text_color=self.colors["text"],
             border_width=1,
             border_color=self.colors["border"],
-            corner_radius=14
+            corner_radius=16
         )
         refresh_btn.grid(row=0, column=2, sticky="e")
 
         body = ctk.CTkFrame(sidebar, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        body.grid_rowconfigure(0, weight=1)
+        body.grid_columnconfigure(0, weight=1)
 
         self.file_tab_inbox = ctk.CTkFrame(body, fg_color="transparent")
         self.file_tab_tagged = ctk.CTkFrame(body, fg_color="transparent")
+        self.file_tab_inbox.grid(row=0, column=0, sticky="nsew")
+        self.file_tab_tagged.grid(row=0, column=0, sticky="nsew")
 
         self.untagged_header_label = ctk.CTkLabel(
             self.file_tab_inbox,
@@ -526,67 +855,138 @@ class NotebookLMSingleFolderApp(ctk.CTk):
             height=32,
             font=self.fonts["small"],
             fg_color=self.colors["panel"],
-            hover_color=self.colors["border"],
+            hover_color=self.colors["panel_alt"],
             text_color=self.colors["text"],
             border_width=1,
             border_color=self.colors["border"],
-            corner_radius=14
+            corner_radius=18
         )
         open_btn.pack(fill="x", padx=8, pady=(0, 8))
 
         tip = ctk.CTkLabel(
             self.file_tab_inbox,
-            text="把檔案放入 input 資料夾，在這裡快速標記",
+            text="Step 1：把檔案放入 input，點檔名後在右側標記",
             font=self.fonts["small"],
             text_color=self.colors["muted"]
         )
         tip.pack(anchor="w", padx=8, pady=(0, 10))
 
+        content_row = ctk.CTkFrame(self.file_tab_inbox, fg_color="transparent")
+        content_row.pack(fill="both", expand=True, padx=8, pady=(0, 10))
+        content_row.grid_rowconfigure(0, weight=1)
+        content_row.grid_columnconfigure(0, weight=3, uniform="file_cols")
+        content_row.grid_columnconfigure(1, weight=2, uniform="file_cols")
+
         list_frame = ctk.CTkFrame(
-            self.file_tab_inbox,
+            content_row,
             fg_color=self.colors["panel"],
-            corner_radius=14,
+            corner_radius=16,
             border_width=1,
             border_color=self.colors["border"]
         )
-        list_frame.pack(fill="both", expand=True, padx=8, pady=(0, 10))
+        list_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
 
         self.untagged_container = ctk.CTkScrollableFrame(
             list_frame,
             fg_color="transparent"
         )
-        self.untagged_container.pack(fill="both", expand=True, padx=8, pady=8)
+        self.untagged_container.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self.tag_panel = ctk.CTkFrame(
+            content_row,
+            fg_color=self.colors["panel"],
+            corner_radius=16,
+            border_width=1,
+            border_color=self.colors["border"]
+        )
+        self.tag_panel.grid(row=0, column=1, sticky="nsew")
+        self.tag_panel.grid_rowconfigure(3, weight=1)
+
+        tag_header = ctk.CTkLabel(
+            self.tag_panel,
+            text="標記",
+            font=self.fonts["section"],
+            text_color=self.colors["text"]
+        )
+        tag_header.pack(anchor="w", padx=16, pady=(16, 6))
+
+        self.tag_selection_label = ctk.CTkLabel(
+            self.tag_panel,
+            text="尚未選擇檔案",
+            font=self.fonts["small"],
+            text_color=self.colors["muted"],
+            wraplength=240,
+            justify="left"
+        )
+        self.tag_selection_label.pack(anchor="w", padx=16, pady=(0, 8))
+
+        tag_buttons = ctk.CTkFrame(self.tag_panel, fg_color="transparent")
+        tag_buttons.pack(fill="x", padx=12, pady=(4, 12))
+
+        self.tag_action_buttons = {}
+        tag_colors = {
+            "【標準】": (self.colors["accent_soft"], "#d2e3fc", self.colors["accent"]),
+            "【範本】": ("#e6f4ea", "#ceead6", self.colors["success"]),
+            "【待審】": ("#fce8e6", "#fad2cf", self.colors["danger"])
+        }
+        for tag in self.cfg.tags:
+            fg, hover, text = tag_colors.get(tag, (self.colors["panel_alt"], self.colors["panel"], self.colors["text"]))
+            btn = ctk.CTkButton(
+                tag_buttons,
+                text=tag,
+                command=lambda t=tag: self._apply_tag_from_panel(t),
+                height=34,
+                font=self.fonts["small"],
+                fg_color=fg,
+                hover_color=hover,
+                text_color=text,
+                corner_radius=18
+            )
+            btn.pack(fill="x", pady=6)
+            self.tag_action_buttons[tag] = btn
+
+        self.tag_panel_note = ctk.CTkLabel(
+            self.tag_panel,
+            text="標記後檔案會移到「已標記」清單",
+            font=self.fonts["small"],
+            text_color=self.colors["muted"],
+            wraplength=240,
+            justify="left"
+        )
+        self.tag_panel_note.pack(anchor="w", padx=16, pady=(0, 16))
 
         self._build_tagged_panel(self.file_tab_tagged)
         self._show_file_tab(self.file_tab_var.get())
 
     def _build_workflow_panel(self, parent):
         """中間：審查工作流程"""
-        parent.grid_rowconfigure(0, weight=2)
-        parent.grid_rowconfigure(1, weight=3)
+        parent.grid_rowconfigure(0, weight=1)
+        parent.grid_rowconfigure(1, weight=1)
         parent.grid_columnconfigure(0, weight=1)
 
         prompt_card, _ = self._create_step_card(
             parent,
             "提示詞",
-            "選擇待審檔案並生成提示詞"
+            "Step 2：選擇待審檔案並生成提示詞",
+            "Step 2"
         )
         prompt_card.grid(row=0, column=0, sticky="nsew", pady=(0, 12))
 
         reply_card, reply_header = self._create_step_card(
             parent,
             "AI 回覆",
-            "貼上或監聽剪貼簿後輸出"
+            "Step 3：貼上或監聽剪貼簿後輸出",
+            "Step 3"
         )
         reply_card.grid(row=1, column=0, sticky="nsew")
 
         menu_kwargs = {
             "fg_color": self.colors["panel"],
-            "button_color": self.colors["border"],
-            "button_hover_color": self.colors["border"],
+            "button_color": self.colors["panel"],
+            "button_hover_color": self.colors["panel_alt"],
             "text_color": self.colors["text"],
             "dropdown_fg_color": self.colors["panel"],
-            "dropdown_hover_color": self.colors["sidebar"],
+            "dropdown_hover_color": self.colors["panel_alt"],
             "dropdown_text_color": self.colors["text"]
         }
 
@@ -621,13 +1021,12 @@ class NotebookLMSingleFolderApp(ctk.CTk):
             fg_color=self.colors["accent"],
             hover_color=self.colors["accent_hover"],
             text_color="#ffffff",
-            corner_radius=14
+            corner_radius=18
         )
         gen_btn.pack(side="left", padx=(10, 0))
 
         self.prompt_display = ctk.CTkTextbox(
             prompt_card,
-            height=160,
             font=self.fonts["body"],
             wrap="word",
             fg_color=self.colors["panel"],
@@ -647,11 +1046,11 @@ class NotebookLMSingleFolderApp(ctk.CTk):
             height=32,
             font=self.fonts["small"],
             fg_color=self.colors["panel"],
-            hover_color=self.colors["border"],
+            hover_color=self.colors["panel_alt"],
             text_color=self.colors["text"],
             border_width=1,
             border_color=self.colors["border"],
-            corner_radius=14
+            corner_radius=18
         )
         copy_btn.pack(side="left", fill="x", expand=True, padx=(0, 6))
 
@@ -662,11 +1061,11 @@ class NotebookLMSingleFolderApp(ctk.CTk):
             height=32,
             font=self.fonts["small"],
             fg_color=self.colors["panel"],
-            hover_color=self.colors["border"],
+            hover_color=self.colors["panel_alt"],
             text_color=self.colors["text"],
             border_width=1,
             border_color=self.colors["border"],
-            corner_radius=14
+            corner_radius=18
         )
         notebooklm_btn.pack(side="left", fill="x", expand=True, padx=6)
 
@@ -677,11 +1076,11 @@ class NotebookLMSingleFolderApp(ctk.CTk):
             height=32,
             font=self.fonts["small"],
             fg_color=self.colors["panel"],
-            hover_color=self.colors["border"],
+            hover_color=self.colors["panel_alt"],
             text_color=self.colors["text"],
             border_width=1,
             border_color=self.colors["border"],
-            corner_radius=14
+            corner_radius=18
         )
         clear_prompt_btn.pack(side="left", fill="x", expand=True, padx=(6, 0))
 
@@ -695,11 +1094,11 @@ class NotebookLMSingleFolderApp(ctk.CTk):
             height=30,
             font=self.fonts["small"],
             fg_color=self.colors["panel"],
-            hover_color=self.colors["border"],
+            hover_color=self.colors["panel_alt"],
             text_color=self.colors["text"],
             border_width=1,
             border_color=self.colors["border"],
-            corner_radius=14
+            corner_radius=18
         )
         clipboard_export_btn.pack(side="left", padx=(0, 8))
 
@@ -712,7 +1111,7 @@ class NotebookLMSingleFolderApp(ctk.CTk):
             fg_color=self.colors["accent"],
             hover_color=self.colors["accent_hover"],
             text_color="#ffffff",
-            corner_radius=14
+            corner_radius=18
         )
         export_btn.pack(side="left")
 
@@ -753,11 +1152,11 @@ class NotebookLMSingleFolderApp(ctk.CTk):
             height=30,
             font=self.fonts["small"],
             fg_color=self.colors["panel"],
-            hover_color=self.colors["border"],
+            hover_color=self.colors["panel_alt"],
             text_color=self.colors["text"],
             border_width=1,
             border_color=self.colors["border"],
-            corner_radius=14
+            corner_radius=18
         )
         open_output_btn.pack(side="left", padx=(0, 8))
 
@@ -768,11 +1167,11 @@ class NotebookLMSingleFolderApp(ctk.CTk):
             height=30,
             font=self.fonts["small"],
             fg_color=self.colors["panel"],
-            hover_color=self.colors["border"],
+            hover_color=self.colors["panel_alt"],
             text_color=self.colors["text"],
             border_width=1,
             border_color=self.colors["border"],
-            corner_radius=14
+            corner_radius=18
         )
         clear_reply_btn.pack(side="left")
 
@@ -804,19 +1203,18 @@ class NotebookLMSingleFolderApp(ctk.CTk):
             border_width=0
         )
         self.tagged_list.pack(fill="both", expand=True, padx=12, pady=12)
+        self.tagged_list.configure(state="disabled")
 
     def _show_file_tab(self, tab_name: str):
         if tab_name == "已標記":
-            self.file_tab_inbox.pack_forget()
-            self.file_tab_tagged.pack(fill="both", expand=True)
+            self.file_tab_tagged.tkraise()
         else:
-            self.file_tab_tagged.pack_forget()
-            self.file_tab_inbox.pack(fill="both", expand=True)
+            self.file_tab_inbox.tkraise()
 
     def _on_file_tab_change(self, value: str):
         self._show_file_tab(value)
 
-    def _create_step_card(self, parent, title, description):
+    def _create_step_card(self, parent, title, description, step_label: Optional[str] = None):
         card = ctk.CTkFrame(
             parent,
             fg_color=self.colors["panel"],
@@ -827,6 +1225,18 @@ class NotebookLMSingleFolderApp(ctk.CTk):
 
         header = ctk.CTkFrame(card, fg_color="transparent")
         header.pack(fill="x", padx=18, pady=(16, 6))
+
+        if step_label:
+            badge = ctk.CTkLabel(
+                header,
+                text=step_label,
+                font=self.fonts["small"],
+                text_color=self.colors["accent"],
+                fg_color=self.colors["accent_soft"],
+                corner_radius=10,
+                height=22
+            )
+            badge.pack(side="left", padx=(0, 8))
 
         ctk.CTkLabel(
             header,
@@ -847,17 +1257,16 @@ class NotebookLMSingleFolderApp(ctk.CTk):
         return card, header
 
     def _create_file_item(self, parent, filename: str):
-        """創建檔案項目（含三個標記按鈕）"""
+        """創建檔案項目（點擊後選擇標記）"""
         item = ctk.CTkFrame(
             parent,
             fg_color=self.colors["panel"],
-            corner_radius=12,
+            corner_radius=14,
             border_width=1,
-            border_color=self.colors["border"],
-            height=52
+            border_color=self.colors["border"]
         )
-        item.pack(fill="x", pady=5, padx=(0, 16))
-        item.pack_propagate(False)
+        item.pack(fill="x", pady=6, padx=(0, 16))
+        item.grid_columnconfigure(0, weight=1)
 
         # 檔名
         name_label = ctk.CTkLabel(
@@ -865,35 +1274,28 @@ class NotebookLMSingleFolderApp(ctk.CTk):
             text=filename,
             font=self.fonts["body"],
             text_color=self.colors["text"],
-            anchor="w"
+            anchor="w",
+            justify="left",
+            wraplength=300
         )
-        name_label.pack(side="left", padx=15, fill="x", expand=True)
+        name_label.grid(row=0, column=0, sticky="w", padx=12, pady=(10, 10))
 
-        # 按鈕區
-        btn_container = ctk.CTkFrame(item, fg_color="transparent")
-        btn_container.pack(side="right", padx=10)
+        click_handler = lambda _e, f=filename: self.select_untagged_file(f)
+        item.bind("<Button-1>", click_handler)
+        name_label.bind("<Button-1>", click_handler)
+        item.bind("<Enter>", lambda _e: self._hover_file_item(filename, True))
+        item.bind("<Leave>", lambda _e: self._hover_file_item(filename, False))
+        name_label.bind("<Enter>", lambda _e: self._hover_file_item(filename, True))
+        name_label.bind("<Leave>", lambda _e: self._hover_file_item(filename, False))
 
-        colors = {
-            "【標準】": ("#e6f0ff", "#d6e7ff", "#007aff"),
-            "【範本】": ("#eaf7ef", "#dff2e7", "#34c759"),
-            "【待審】": ("#fdecea", "#fbd9d6", "#ff3b30")
-        }
+        self._untagged_item_widgets[filename] = item
 
-        for tag in self.cfg.tags:
-            fg, hover, text = colors[tag]
-            btn = ctk.CTkButton(
-                btn_container,
-                text=tag,
-                command=lambda t=tag, f=filename: self.tag_file(f, t),
-                width=68,
-                height=30,
-                font=self.fonts["small"],
-                fg_color=fg,
-                hover_color=hover,
-                text_color=text,
-                corner_radius=12
-            )
-            btn.pack(side="left", padx=3)
+    def report_callback_exception(self, exc, val, tb):
+        self.logger.error("未處理的介面錯誤", exc_info=(exc, val, tb))
+        messagebox.showerror(
+            "錯誤",
+            "發生非預期錯誤，請稍後再試或回報系統管理員。\n詳細資訊請見 logs。"
+        )
 
     # ==================== 行為方法 ====================
 
@@ -904,26 +1306,41 @@ class NotebookLMSingleFolderApp(ctk.CTk):
         return self.combo_delivery.get()
 
     def on_selection_change(self):
+        if self._suppress_selection_change:
+            return
         self.refresh_all()
         self._restart_watchdog()
+        self._save_settings()
+
+    def on_notification_policy_change(self):
+        if self._suppress_notify_change:
+            return
+        if self.notification_policy_var.get() == "靜音":
+            self._clear_notification()
+        self._save_settings()
+
+    def _open_folder(self, path: str):
+        ok, err = open_folder(path)
+        if not ok:
+            self.logger.error("無法開啟資料夾：%s (%s)", path, err)
+            messagebox.showerror("錯誤", f"無法開啟資料夾：\n{path}\n{err}")
 
     def open_input(self):
         path = self.fm.input_dir(self.current_project(), self.current_delivery())
-        open_folder(path)
+        self._open_folder(path)
 
     def open_output(self):
         path = self.fm.output_dir(self.current_project(), self.current_delivery())
-        open_folder(path)
+        self._open_folder(path)
 
     def show_help(self):
         help_text = (
-            "1) 點「📂」開啟 input 資料夾，把檔案放進去\n"
-            "2) 在左側為未標記檔案加上【標準/範本/待審】標籤\n"
-            "3) 中間選擇待審檔案，生成提示詞並貼到 NotebookLM\n"
-            "4) 把 AI 回覆貼回來，按「輸出 Word 報告」\n"
-            "5) 或直接用「從剪貼簿輸出 / 自動監聽剪貼簿」"
+            "Step 1：把檔案放入 input，點檔名後在右側標記\n"
+            "Step 2：選擇待審檔案，生成提示詞並貼到 NotebookLM\n"
+            "Step 3：貼上回覆後輸出 Word，或用剪貼簿輸出/監聽\n\n"
+            "自訂專案/交付：在程式同層建立 lmreview_config.json"
         )
-        messagebox.showinfo("使用說明", help_text)
+        messagebox.showinfo("快速提示", help_text)
 
     def tag_file(self, filename: str, tag: str):
         """標記檔案"""
@@ -932,9 +1349,48 @@ class NotebookLMSingleFolderApp(ctk.CTk):
         
         if success:
             self.show_notification(f"✓ 已標記為 {tag}")
+            if self._selected_untagged_file == filename:
+                self._selected_untagged_file = None
             self.refresh_all()
         else:
             messagebox.showerror("錯誤", f"標記失敗：{result}")
+
+    def _hover_file_item(self, filename: str, entering: bool):
+        item = self._untagged_item_widgets.get(filename)
+        if not item:
+            return
+        if self._selected_untagged_file == filename:
+            return
+        item.configure(border_color=self.colors["accent"] if entering else self.colors["border"])
+
+    def select_untagged_file(self, filename: str):
+        self._selected_untagged_file = filename
+        for name, item in self._untagged_item_widgets.items():
+            if name == filename:
+                item.configure(border_color=self.colors["accent"])
+            else:
+                item.configure(border_color=self.colors["border"])
+        self._update_tag_panel()
+
+    def _apply_tag_from_panel(self, tag: str):
+        if not self._selected_untagged_file:
+            messagebox.showwarning("提醒", "請先選擇檔案")
+            return
+        self.tag_file(self._selected_untagged_file, tag)
+
+    def _update_tag_panel(self):
+        filename = self._selected_untagged_file
+        if hasattr(self, "tag_selection_label"):
+            if filename:
+                self.tag_selection_label.configure(text=f"已選擇：{filename}")
+            else:
+                self.tag_selection_label.configure(text="尚未選擇檔案")
+        if filename:
+            for btn in self.tag_action_buttons.values():
+                btn.configure(state="normal")
+        else:
+            for btn in self.tag_action_buttons.values():
+                btn.configure(state="disabled")
 
     def refresh_all(self):
         """刷新所有顯示"""
@@ -950,6 +1406,7 @@ class NotebookLMSingleFolderApp(ctk.CTk):
         # 清空容器
         for widget in self.untagged_container.winfo_children():
             widget.destroy()
+        self._untagged_item_widgets = {}
 
         if untagged is None:
             p, d = self.current_project(), self.current_delivery()
@@ -968,8 +1425,13 @@ class NotebookLMSingleFolderApp(ctk.CTk):
             for filename in untagged:
                 self._create_file_item(self.untagged_container, filename)
 
+        if self._selected_untagged_file not in (untagged or []):
+            self._selected_untagged_file = None
+        self._update_tag_panel()
+
     def refresh_tagged_files(self, tagged: Optional[List[str]] = None):
         """刷新已標記檔案列表"""
+        self.tagged_list.configure(state="normal")
         self.tagged_list.delete("1.0", "end")
 
         if tagged is None:
@@ -1002,6 +1464,7 @@ class NotebookLMSingleFolderApp(ctk.CTk):
 
         # CTkTextbox forbids per-tag font to keep scaling consistent; use color only.
         self.tagged_list.tag_config("header", foreground=self.colors["accent"])
+        self.tagged_list.configure(state="disabled")
 
     def refresh_review_combo(self, tagged: Optional[List[str]] = None):
         """刷新待審檔案下拉選單"""
@@ -1011,8 +1474,9 @@ class NotebookLMSingleFolderApp(ctk.CTk):
 
         review = [f for f in tagged if f.startswith("【待審】")]
         if review:
+            current = self.combo_review_var.get()
             self.combo_review.configure(values=review, state="normal")
-            self.combo_review.set(review[0])
+            self.combo_review.set(current if current in review else review[0])
         else:
             self.combo_review.configure(values=["(無)"], state="disabled")
             self.combo_review.set("(無)")
@@ -1036,7 +1500,7 @@ class NotebookLMSingleFolderApp(ctk.CTk):
     def generate_prompt(self):
         """生成審查提示詞"""
         p, d = self.current_project(), self.current_delivery()
-        tagged, untagged = self.fm.list_input_files(p, d)
+        tagged, _ = self.fm.list_input_files(p, d)
         self.refresh_review_combo(tagged)
         
         std = [f for f in tagged if f.startswith("【標準】")]
@@ -1128,6 +1592,9 @@ class NotebookLMSingleFolderApp(ctk.CTk):
                 self.show_notification("⚠ 請先選擇待審檔案")
             return False
 
+        if not self._ensure_docx_available(show_error_dialog):
+            return False
+
         try:
             path = self.exporter.export(
                 self.fm.output_dir(self.current_project(), self.current_delivery()),
@@ -1136,7 +1603,7 @@ class NotebookLMSingleFolderApp(ctk.CTk):
             )
             self.show_notification(f"✓ Word 已輸出：{os.path.basename(path)}")
             if open_dir:
-                open_folder(os.path.dirname(path))
+                self._open_folder(os.path.dirname(path))
             return True
         except Exception as e:
             self.logger.error("Word 輸出失敗：%s", e)
@@ -1146,21 +1613,57 @@ class NotebookLMSingleFolderApp(ctk.CTk):
                 self.show_notification("⚠ Word 輸出失敗")
             return False
 
-    def show_notification(self, message: str):
+    def _notification_level(self, message: str, level: Optional[str]) -> str:
+        if level in {"info", "warn"}:
+            return level
+        stripped = message.strip()
+        if stripped.startswith(("⚠", "！", "!", "❗")):
+            return "warn"
+        return "info"
+
+    def _notification_policy_allows(self, level: str) -> bool:
+        policy = self.notification_policy_var.get() if hasattr(self, "notification_policy_var") else "全部"
+        if policy == "靜音":
+            return False
+        if policy == "精簡" and level == "info":
+            return False
+        return True
+
+    def show_notification(self, message: str, level: Optional[str] = None):
         """顯示通知"""
+        level = self._notification_level(message, level)
+        if not self._notification_policy_allows(level):
+            return
+        now = time.time()
+        if level == "info" and message == self._notification_last_message:
+            elapsed_ms = (now - self._notification_last_at) * 1000
+            if elapsed_ms < self._notification_cooldown_ms:
+                return
+        if self._notification_job:
+            self.after_cancel(self._notification_job)
+            self._notification_job = None
         self.notification.configure(text=f"  {message}  ", height=36)
-        self.after(3000, lambda: self.notification.configure(text="", height=0))
+        self._notification_job = self.after(3000, self._clear_notification)
+        self._notification_last_at = now
+        self._notification_last_message = message
+
+    def _clear_notification(self):
+        self._notification_job = None
+        self.notification.configure(text="", height=0)
 
     def toggle_clipboard_watch(self):
         if self.clipboard_auto_var.get():
             self._last_clipboard = None
+            self._clipboard_no_review_notice = False
             self.show_notification("✓ 已啟用剪貼簿監聽")
             self._schedule_clipboard_poll(immediate=True)
         else:
             if self._clipboard_job:
                 self.after_cancel(self._clipboard_job)
                 self._clipboard_job = None
+            self._clipboard_no_review_notice = False
             self.show_notification("✓ 已停止剪貼簿監聽")
+        self._save_settings()
 
     def _schedule_clipboard_poll(self, immediate: bool = False):
         if self._clipboard_job:
@@ -1172,6 +1675,13 @@ class NotebookLMSingleFolderApp(ctk.CTk):
         self._clipboard_job = None
         if not self.clipboard_auto_var.get():
             return
+        if self.combo_review_var.get() == "(無)":
+            if not self._clipboard_no_review_notice:
+                self.show_notification("⚠ 請先選擇待審檔案")
+                self._clipboard_no_review_notice = True
+            self._schedule_clipboard_poll()
+            return
+        self._clipboard_no_review_notice = False
         content = self._get_clipboard_text()
         if content and content != self._last_clipboard:
             self._last_clipboard = content
@@ -1192,7 +1702,13 @@ class NotebookLMSingleFolderApp(ctk.CTk):
         """啟動檔案監控"""
         if self.observer is None:
             self.observer = Observer()
-            self.observer.start()
+            try:
+                self.observer.start()
+            except Exception as e:
+                self.logger.error("檔案監控啟動失敗：%s", e)
+                self.observer = None
+                self.show_notification("⚠ 檔案監控啟動失敗")
+                return
         self._restart_watchdog()
 
     def _restart_watchdog(self):
@@ -1200,17 +1716,29 @@ class NotebookLMSingleFolderApp(ctk.CTk):
         if self.observer:
             self.observer.unschedule_all()
             watch_path = self.fm.input_dir(self.current_project(), self.current_delivery())
-            handler = AutoTagHandler(self)
-            self.observer.schedule(handler, watch_path, recursive=False)
+            try:
+                os.makedirs(watch_path, exist_ok=True)
+                handler = AutoTagHandler(self)
+                self.observer.schedule(handler, watch_path, recursive=False)
+            except Exception as e:
+                self.logger.error("設定檔案監控失敗：%s", e)
+                self.show_notification("⚠ 無法啟用檔案監控")
+
+    def _on_close(self):
+        self._save_settings()
+        self.destroy()
 
     def destroy(self):
         """清理資源"""
+        if self._notification_job:
+            self.after_cancel(self._notification_job)
+            self._notification_job = None
         if self._clipboard_job:
             self.after_cancel(self._clipboard_job)
             self._clipboard_job = None
         if self.observer:
             self.observer.stop()
-            self.observer.join()
+            self.observer.join(timeout=2)
         super().destroy()
 
 # ==================== main ====================

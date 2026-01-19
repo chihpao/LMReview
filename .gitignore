@@ -1,7 +1,10 @@
 __pycache__/
 *.pyc
+build/
+dist/
 logs/
 *.log
+settings.json
 **/input/
 **/output/
 *.docx
